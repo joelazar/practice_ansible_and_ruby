@@ -1,0 +1,3 @@
+keypair: aws_drupal
+image:  ami-82be18ed # Amazon Linux
+region: "eu-central-1"

@@ -1,0 +1,164 @@
+---
+- name: Stage instance(s)
+  hosts: local
+  connection: local
+  remote_user: root
+  gather_facts: false
+  vars_files:
+    - vars/external_variables.yml
+  vars:
+    instance_type: t2.micro
+    tag_Name: "Practice"
+    tag_Type: "DrupalServer"
+    tag_Environment: "production"
+
+  tasks:
+    - name: Setup drupal security group
+      ec2_group:
+        state: present
+        region: "{{ region }}"
+        name: drupal
+        description: drupal security group
+        rules:
+          - proto: tcp
+            from_port: 22
+            to_port: 22
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 80
+            to_port: 80
+            cidr_ip: 0.0.0.0/0
+          - proto: tcp
+            from_port: 443
+            to_port: 443
+            cidr_ip: 0.0.0.0/0
+          - proto: all
+            group_name: drupal
+        rules_egress:
+          - proto: all
+            cidr_ip: 0.0.0.0/0
+      register: drupal_group
+
+    - name: Launch instance
+      ec2: keypair={{keypair}} group_id={{ drupal_group.group_id }}
+           instance_type={{instance_type}} image={{image}}
+           region={{ region }} count=1
+           instance_tags='{ "Name":"{{tag_Name}}","Type":"{{tag_Type}}","Environment":"{{tag_Environment}}" }'
+           wait=true
+      register: ec2
+
+    - name: Add new instances to host group
+      add_host: hostname={{item.public_ip}} groupname=deploy
+      with_items: "{{ ec2.instances }}"
+
+    - name: Wait for the instances to boot by checking the ssh port
+      wait_for: host={{item.public_dns_name}} port=22 delay=60 timeout=320 state=started
+      with_items: "{{ ec2.instances }}"
+
+- name: Configure instance
+  hosts: deploy
+  remote_user: ec2-user
+  sudo: yes
+  gather_facts: True
+  vars:
+      db_name: "drupal_db"
+      db_user: "user"
+      db_password: "password"
+  tasks:
+    - name: upgrade all packages
+      yum:
+        name: '*'
+        state: latest
+
+    - name: Install packages
+      yum: name={{ item }} state=latest
+      with_items:
+        - php56
+        - php56-mysqlnd
+        - php56-gd
+        - php56-cli
+        - php56-mbstring
+        - git
+        - MySQL-python27
+        - mysql-server
+
+    - name: AllowOverride all
+      replace:
+        dest=/etc/httpd/conf/httpd.conf
+        regexp='AllowOverride None'
+        replace='AllowOverride All'
+      sudo: yes
+
+    - name: Restart Apache
+      service: name=httpd state=restarted
+
+    - name: Restart Mysql
+      service: name=mysqld state=restarted
+      
+    - name: Create the Drupal database
+      mysql_db: db={{ db_name }} state=present
+
+    - name: Create the Drupal user
+      mysql_user: >
+        name={{ db_user }}
+        password={{ db_password }}
+        priv={{ db_name }}.*:ALL
+        host=localhost
+
+    - name: Clone Drupal
+      git: >
+        repo=http://git.drupal.org/project/drupal.git
+        dest=/var/www/html/drupal/
+        update=no
+
+    - name: Create settings.php
+      command: cp /var/www/html/drupal/sites/default/default.settings.php /var/www/html/drupal/sites/default/settings.php
+
+    - name: Create services.yml
+      command: cp /var/www/html/drupal/sites/default/default.services.yml /var/www/html/drupal/sites/default/services.yml
+
+    - name: Update permissions of settings.php
+      file: path=/var/www/html/drupal/sites/default/settings.php mode=777
+
+    - name: Update permissions of services.yml
+      file: path=/var/www/html/drupal/sites/default/services.yml mode=777
+
+    - name: Update permissions of files directory
+      file: >
+        path=/var/www/html/drupal/sites/default/files
+        mode=777
+        state=directory
+        recurse=yes
+
+    - name: Download composer
+      get_url:
+        url: https://getcomposer.org/installer
+        dest: /tmp/installer
+      tags: composer
+
+    - name: Install composer
+      shell: cat /tmp/installer | php -- --install-dir=/usr/bin --filename=composer
+      tags: composer
+
+    - name: Install php dependencies for drupal
+      composer:
+        command: install
+        working_dir: /var/www/html/drupal/
+
+    - name: Install drush
+      composer:
+        command: "require"
+        arguments: "drush/drush=dev-master --update-with-dependencies"
+        working_dir: "~/.composer"
+      sudo: no
+
+    - name: Create drush symlink.
+      file:
+        src: "/home/ec2-user/.composer/vendor/drush/drush/drush"
+        dest: "/usr/bin/drush"
+        state: link
+        force: yes
+
+    - name: Setup drupal site with drush
+      shell: drush site-install standard -y --root=/var/www/html/drupal/ --site-name=Practice --account-name=admin --account-pass=admin --db-url=mysql://{{ db_user }}:{{ db_password }}@localhost/{{ db_name }}
+      sudo: no

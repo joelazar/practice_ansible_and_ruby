@@ -1,0 +1,5 @@
+[local]
+localhost
+#[local:vars] # Only needed on my mac
+#ansible_python_interpreter=/Users/joelazar/.homebrew/bin/python2
+[deploy]
